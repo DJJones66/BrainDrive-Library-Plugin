@@ -1,0 +1,46 @@
+{
+  "name": "braindrive-library-plugin",
+  "version": "1.1.1",
+  "description": "Library capture and editor plugin for routing and editing user-scoped BrainDrive library files",
+  "main": "dist/remoteEntry.js",
+  "scripts": {
+    "build": "webpack --env release=true",
+    "build:local": "webpack --env release=false",
+    "build:release": "webpack --env release=true",
+    "dev": "webpack serve --mode development",
+    "start": "webpack serve --mode development",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "braindrive",
+    "plugin",
+    "library",
+    "editor",
+    "markdown",
+    "filesystem"
+  ],
+  "author": "BrainDrive",
+  "license": "MIT",
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "css-loader": "^6.8.1",
+    "html-webpack-plugin": "^5.5.3",
+    "style-loader": "^3.3.3",
+    "ts-loader": "^9.4.4",
+    "typescript": "^5.1.6",
+    "webpack": "^5.88.2",
+    "webpack-cli": "^5.1.4",
+    "webpack-dev-server": "^4.15.1"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}

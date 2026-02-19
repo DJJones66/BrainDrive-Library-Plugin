@@ -1,0 +1,387 @@
+:root {
+  --library-bg-color: #ffffff;
+  --library-surface: #ffffff;
+  --library-panel: #f7fbff;
+  --library-text: #333333;
+  --library-text-muted: #58657a;
+  --library-border: rgba(0, 0, 0, 0.14);
+  --library-hover: rgba(0, 0, 0, 0.05);
+  --library-primary: #2196f3;
+  --library-primary-contrast: #ffffff;
+  --library-secondary: #e7edf5;
+  --library-danger: #f44336;
+  --library-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --library-shadow-md: 0 8px 20px rgba(0, 0, 0, 0.1);
+  --library-shadow-lg: 0 18px 36px rgba(15, 38, 66, 0.14);
+  --library-accent-wash: linear-gradient(
+    128deg,
+    rgba(33, 150, 243, 0.16),
+    rgba(33, 150, 243, 0.04) 52%,
+    rgba(244, 67, 54, 0.08)
+  );
+}
+
+.library-editor-root.dark-theme {
+  --library-bg-color: #121a28;
+  --library-surface: #1a2332;
+  --library-panel: #101a2a;
+  --library-text: #e0e0e0;
+  --library-text-muted: #9fb2cc;
+  --library-border: rgba(255, 255, 255, 0.12);
+  --library-hover: rgba(255, 255, 255, 0.08);
+  --library-primary: #2196f3;
+  --library-primary-contrast: #ffffff;
+  --library-secondary: #2c3a4f;
+  --library-danger: #f44336;
+  --library-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --library-shadow-md: 0 10px 24px rgba(0, 0, 0, 0.4);
+  --library-shadow-lg: 0 24px 50px rgba(0, 0, 0, 0.55);
+  --library-accent-wash: linear-gradient(
+    132deg,
+    rgba(33, 150, 243, 0.2),
+    rgba(12, 18, 29, 0.02) 52%,
+    rgba(244, 67, 54, 0.14)
+  );
+}
+
+.library-editor-root {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  padding: 12px;
+  color: var(--library-text);
+  background:
+    radial-gradient(circle at 100% 0%, rgba(33, 150, 243, 0.15), transparent 40%),
+    radial-gradient(circle at 0% 100%, rgba(244, 67, 54, 0.1), transparent 34%),
+    var(--library-bg-color);
+  font-family: "Space Grotesk", "Plus Jakarta Sans", "Avenir Next", sans-serif;
+}
+
+.library-editor-shell {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+  flex: 1;
+}
+
+.library-tree-panel,
+.library-main-panel {
+  border: 1px solid var(--library-border);
+  border-radius: 14px;
+  background: var(--library-surface);
+  box-shadow: var(--library-shadow-md);
+  min-height: 0;
+}
+
+.library-tree-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.library-tree-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--library-border);
+  background: var(--library-panel);
+}
+
+.library-search {
+  width: 100%;
+  border: 1px solid var(--library-border);
+  background: var(--library-surface);
+  color: var(--library-text);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.library-search:focus {
+  outline: none;
+  border-color: var(--library-primary);
+  box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.2);
+}
+
+.library-tree-content {
+  padding: 8px;
+  overflow-y: auto;
+}
+
+.library-tree-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.library-tree-item {
+  width: 100%;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 10px;
+  color: var(--library-text);
+  cursor: pointer;
+  padding: 8px 10px;
+  text-align: left;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.library-tree-item:hover {
+  background: var(--library-hover);
+}
+
+.library-tree-item.active {
+  border-color: rgba(33, 150, 243, 0.55);
+  background: rgba(33, 150, 243, 0.12);
+}
+
+.library-tree-icon {
+  font-size: 14px;
+}
+
+.library-tree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.library-tree-size {
+  font-size: 11px;
+  color: var(--library-text-muted);
+}
+
+.library-main-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.library-main-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--library-border);
+  padding: 12px;
+  background: var(--library-panel);
+}
+
+.library-main-title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.library-main-meta {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--library-text-muted);
+  word-break: break-word;
+}
+
+.library-main-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.library-main-content {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.library-editor-textarea {
+  width: 100%;
+  min-height: 320px;
+  flex: 1;
+  resize: vertical;
+  border: 1px solid var(--library-border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--library-surface);
+  color: var(--library-text);
+  font-size: 14px;
+  line-height: 1.5;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.library-editor-textarea:focus {
+  outline: none;
+  border-color: var(--library-primary);
+  box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.2);
+}
+
+.library-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  border: 1px dashed var(--library-border);
+  border-radius: 12px;
+  color: var(--library-text-muted);
+  text-align: center;
+  padding: 16px;
+}
+
+.library-code-preview {
+  margin: 0;
+  border: 1px solid var(--library-border);
+  border-radius: 12px;
+  background: var(--library-panel);
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.library-markdown-preview {
+  border: 1px solid var(--library-border);
+  border-radius: 12px;
+  background: var(--library-panel);
+  padding: 14px;
+  line-height: 1.58;
+  font-size: 14px;
+}
+
+.library-markdown-preview :first-child {
+  margin-top: 0;
+}
+
+.library-markdown-preview :last-child {
+  margin-bottom: 0;
+}
+
+.library-markdown-preview h1,
+.library-markdown-preview h2,
+.library-markdown-preview h3,
+.library-markdown-preview h4 {
+  line-height: 1.22;
+  margin: 1.05em 0 0.45em;
+}
+
+.library-markdown-preview pre {
+  overflow-x: auto;
+  background: rgba(16, 26, 42, 0.11);
+  border: 1px solid var(--library-border);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.library-markdown-preview code {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.library-markdown-preview table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.library-markdown-preview th,
+.library-markdown-preview td {
+  border: 1px solid var(--library-border);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.library-markdown-preview blockquote {
+  margin: 0.8em 0;
+  border-left: 4px solid var(--library-primary);
+  padding-left: 10px;
+  color: var(--library-text-muted);
+}
+
+.library-state-text,
+.library-state-error {
+  margin: 6px 4px;
+  font-size: 13px;
+}
+
+.library-state-text {
+  color: var(--library-text-muted);
+}
+
+.library-state-error {
+  color: var(--library-danger);
+}
+
+.library-btn {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  transition: transform 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+}
+
+.library-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.library-btn:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: var(--library-shadow-sm);
+}
+
+.library-btn.primary {
+  background: var(--library-primary);
+  color: var(--library-primary-contrast);
+}
+
+.library-btn.secondary {
+  background: var(--library-secondary);
+  color: var(--library-text);
+  border-color: var(--library-border);
+}
+
+@media (max-width: 980px) {
+  .library-editor-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .library-tree-panel {
+    display: none;
+    max-height: 50vh;
+  }
+
+  .library-tree-panel.open {
+    display: flex;
+  }
+}
+
+@media (max-width: 720px) {
+  .library-editor-root {
+    padding: 8px;
+  }
+
+  .library-main-toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .library-main-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
