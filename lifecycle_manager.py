@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -24,6 +25,22 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+try:
+    from app.core.job_manager_provider import get_job_manager  # type: ignore
+except Exception:  # pragma: no cover - fallback for remote install
+    get_job_manager = None
+    try:
+        import sys
+
+        _current_dir = Path(__file__).resolve().parent
+        for parent in (_current_dir, *_current_dir.parents):
+            if (parent / "app" / "core" / "job_manager_provider.py").exists():
+                sys.path.insert(0, str(parent))
+                from app.core.job_manager_provider import get_job_manager  # type: ignore
+                break
+    except Exception:
+        get_job_manager = None
+
 CURRENT_DIR = Path(__file__).resolve().parent
 
 HELPER_PATH = CURRENT_DIR / "community_lifecycle_manager.py"
@@ -34,6 +51,34 @@ helper_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper_module)
 CommunityPluginLifecycleBase = helper_module.CommunityPluginLifecycleBase
 
+SERVICE_OPS_PATH = CURRENT_DIR / "service_ops.py"
+service_ops_spec = importlib.util.spec_from_file_location(
+    "library.service_ops", SERVICE_OPS_PATH
+)
+service_ops_module = (
+    importlib.util.module_from_spec(service_ops_spec)
+    if service_ops_spec and service_ops_spec.loader
+    else None
+)
+if service_ops_module is not None:
+    service_ops_spec.loader.exec_module(service_ops_module)
+
+prepare_service = (
+    getattr(service_ops_module, "prepare_service", None)
+    if service_ops_module is not None
+    else None
+)
+start_service = (
+    getattr(service_ops_module, "start_service", None)
+    if service_ops_module is not None
+    else None
+)
+health_check = (
+    getattr(service_ops_module, "health_check", None)
+    if service_ops_module is not None
+    else None
+)
+
 logger = structlog.get_logger()
 
 LIBRARY_SERVICE_REPO_URL = "https://github.com/DJJones66/Library-Service"
@@ -41,6 +86,25 @@ LIBRARY_SERVICE_RUNTIME_DIR_NAME = "Library-Service"
 SERVICES_RUNTIME_ENV_VAR = "BRAINDRIVE_SERVICES_RUNTIME_DIR"
 DIRTY_WORKTREE_POLICY_ENV_VAR = "BRAINDRIVE_LIBRARY_RUNTIME_DIRTY_POLICY"
 DEFAULT_DIRTY_WORKTREE_POLICY = "stash"
+LIBRARY_SERVICE_SETTINGS_DEFINITION_ID = "braindrive_library_service_settings"
+LIBRARY_SERVICE_INSTALL_COMMAND = "python service_scripts/install_with_venv.py"
+LIBRARY_SERVICE_START_COMMAND = "python service_scripts/start_with_venv.py"
+LIBRARY_SERVICE_STOP_COMMAND = "python service_scripts/shutdown_with_venv.py"
+LIBRARY_SERVICE_RESTART_COMMAND = "python service_scripts/restart_with_venv.py"
+LIBRARY_SERVICE_DEFAULT_HOST = "127.0.0.1"
+LIBRARY_SERVICE_DEFAULT_PORT = "18170"
+LIBRARY_SERVICE_DEFAULT_HEALTHCHECK_URL = (
+    f"http://localhost:{LIBRARY_SERVICE_DEFAULT_PORT}/health"
+)
+LIBRARY_SERVICE_ENV_INHERIT = "minimal"
+DEFAULT_LIBRARY_REQUIRED_ENV_VARS = [
+    "PROCESS_HOST",
+    "PROCESS_PORT",
+    "BRAINDRIVE_LIBRARY_PATH",
+    "BRAINDRIVE_LIBRARY_BASE_TEMPLATE_PATH",
+    "BRAINDRIVE_LIBRARY_REQUIRE_USER_HEADER",
+    SERVICES_RUNTIME_ENV_VAR,
+]
 
 PLUGIN_DATA: Dict[str, Any] = {
     "name": "BrainDrive Library Plugin",
@@ -760,6 +824,328 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             update_existing,
         )
 
+    def _required_env_vars_by_service(self) -> Dict[str, List[str]]:
+        if service_ops_module is not None:
+            getter = getattr(service_ops_module, "get_required_env_vars_map", None)
+            if callable(getter):
+                try:
+                    values = getter()
+                    if isinstance(values, dict):
+                        return {
+                            str(key): [str(item) for item in (items or [])]
+                            for key, items in values.items()
+                        }
+                except Exception as error:
+                    logger.warning(
+                        "Failed to derive Library service required_env_vars from service_ops",
+                        error=str(error),
+                    )
+
+        return {"library_service": list(DEFAULT_LIBRARY_REQUIRED_ENV_VARS)}
+
+    def _service_ops_path_for_jobs(self) -> Path:
+        candidate = self.shared_path / "service_ops.py"
+        if candidate.exists():
+            return candidate
+        return SERVICE_OPS_PATH
+
+    @staticmethod
+    def _supports_installer_user_id_kwarg(func: Any) -> bool:
+        try:
+            signature = inspect.signature(func)
+        except Exception:
+            return False
+
+        if "installer_user_id" in signature.parameters:
+            return True
+
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+    def _build_runtime_service_rows(self) -> List[Dict[str, Any]]:
+        runtime_root = self._resolve_services_runtime_dir()
+        runtime_dir = runtime_root / LIBRARY_SERVICE_RUNTIME_DIR_NAME
+        required_env_vars = self._required_env_vars_by_service().get(
+            "library_service", list(DEFAULT_LIBRARY_REQUIRED_ENV_VARS)
+        )
+
+        return [
+            {
+                "name": "library_service",
+                "source_url": LIBRARY_SERVICE_REPO_URL,
+                "type": "venv_process",
+                "install_command": LIBRARY_SERVICE_INSTALL_COMMAND,
+                "start_command": LIBRARY_SERVICE_START_COMMAND,
+                "stop_command": LIBRARY_SERVICE_STOP_COMMAND,
+                "restart_command": LIBRARY_SERVICE_RESTART_COMMAND,
+                "healthcheck_url": LIBRARY_SERVICE_DEFAULT_HEALTHCHECK_URL,
+                "definition_id": LIBRARY_SERVICE_SETTINGS_DEFINITION_ID,
+                "required_env_vars": required_env_vars,
+                "runtime_dir_key": LIBRARY_SERVICE_RUNTIME_DIR_NAME,
+                "env_inherit": LIBRARY_SERVICE_ENV_INHERIT,
+                "env_overrides": {
+                    "PROCESS_HOST": LIBRARY_SERVICE_DEFAULT_HOST,
+                    "PROCESS_PORT": LIBRARY_SERVICE_DEFAULT_PORT,
+                    SERVICES_RUNTIME_ENV_VAR: str(runtime_root),
+                    "BRAINDRIVE_LIBRARY_PATH": str((runtime_dir / "library").resolve()),
+                    "BRAINDRIVE_LIBRARY_BASE_TEMPLATE_PATH": str(
+                        (runtime_dir / "library_templates" / "Base_Library").resolve()
+                    ),
+                    "BRAINDRIVE_LIBRARY_REQUIRE_USER_HEADER": "true",
+                },
+            }
+        ]
+
+    async def _upsert_service_runtime_rows(
+        self,
+        user_id: str,
+        plugin_id: str,
+        db: AsyncSession,
+        *,
+        now: str,
+    ) -> Dict[str, Any]:
+        upsert_stmt = text(
+            """
+            INSERT INTO plugin_service_runtime (
+              id, plugin_id, plugin_slug, name, source_url, type,
+              install_command, start_command, stop_command, restart_command,
+              healthcheck_url, definition_id, required_env_vars,
+              runtime_dir_key, env_inherit, env_overrides, status,
+              created_at, updated_at, user_id
+            ) VALUES (
+              :id, :plugin_id, :plugin_slug, :name, :source_url, :type,
+              :install_command, :start_command, :stop_command, :restart_command,
+              :healthcheck_url, :definition_id, :required_env_vars,
+              :runtime_dir_key, :env_inherit, :env_overrides, :status,
+              :created_at, :updated_at, :user_id
+            )
+            ON CONFLICT(id) DO UPDATE SET
+              plugin_id = excluded.plugin_id,
+              plugin_slug = excluded.plugin_slug,
+              name = excluded.name,
+              source_url = excluded.source_url,
+              type = excluded.type,
+              install_command = excluded.install_command,
+              start_command = excluded.start_command,
+              stop_command = excluded.stop_command,
+              restart_command = excluded.restart_command,
+              healthcheck_url = excluded.healthcheck_url,
+              definition_id = excluded.definition_id,
+              required_env_vars = excluded.required_env_vars,
+              runtime_dir_key = excluded.runtime_dir_key,
+              env_inherit = excluded.env_inherit,
+              env_overrides = excluded.env_overrides,
+              status = excluded.status,
+              updated_at = excluded.updated_at,
+              user_id = excluded.user_id
+            """
+        )
+
+        created_ids: List[str] = []
+        for service_data in self._build_runtime_service_rows():
+            service_id = (
+                f"{user_id}_{self.plugin_data['plugin_slug']}_{service_data['name']}"
+            )
+            payload = {
+                "id": service_id,
+                "plugin_id": plugin_id,
+                "plugin_slug": self.plugin_data["plugin_slug"],
+                "name": service_data["name"],
+                "source_url": service_data.get("source_url"),
+                "type": service_data.get("type"),
+                "install_command": service_data.get("install_command"),
+                "start_command": service_data.get("start_command"),
+                "stop_command": service_data.get("stop_command"),
+                "restart_command": service_data.get("restart_command"),
+                "healthcheck_url": service_data.get("healthcheck_url"),
+                "definition_id": service_data.get("definition_id"),
+                "required_env_vars": json.dumps(
+                    service_data.get("required_env_vars", [])
+                ),
+                "runtime_dir_key": service_data.get("runtime_dir_key"),
+                "env_inherit": service_data.get("env_inherit"),
+                "env_overrides": json.dumps(service_data.get("env_overrides") or {}),
+                "status": "pending",
+                "created_at": now,
+                "updated_at": now,
+                "user_id": user_id,
+            }
+            await db.execute(upsert_stmt, payload)
+            created_ids.append(service_id)
+
+        return {"success": True, "service_ids": created_ids}
+
+    async def _prepare_services(self, user_id: str) -> Dict[str, Any]:
+        if not callable(prepare_service):
+            return {
+                "skipped": True,
+                "reason": "library_service_ops_missing",
+            }
+
+        skip = os.environ.get("BRAINDRIVE_LIBRARY_SKIP_SERVICE_INSTALL", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        full_install = os.environ.get("BRAINDRIVE_LIBRARY_FULL_INSTALL", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        force_recreate = os.environ.get("BRAINDRIVE_LIBRARY_FORCE_VENV", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        auto_start = os.environ.get("BRAINDRIVE_LIBRARY_AUTO_START", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        async_mode = os.environ.get("BRAINDRIVE_LIBRARY_ASYNC_INSTALL", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        use_jobs = os.environ.get("BRAINDRIVE_LIBRARY_USE_JOB_MANAGER", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        if skip:
+            return {
+                "skipped": True,
+                "reason": "BRAINDRIVE_LIBRARY_SKIP_SERVICE_INSTALL env set",
+            }
+
+        service_keys = ["library_service"]
+
+        if use_jobs and get_job_manager:
+            try:
+                job_manager = await get_job_manager()
+                job, _ = await job_manager.enqueue_job(
+                    job_type="service.install",
+                    payload={
+                        "service_ops_path": str(self._service_ops_path_for_jobs()),
+                        "service_keys": service_keys,
+                        "full_install": full_install,
+                        "force_recreate": force_recreate,
+                        "auto_start": auto_start,
+                        "installer_user_id": user_id,
+                    },
+                    user_id=user_id,
+                    workspace_id=None,
+                    idempotency_key=(
+                        "library_install_"
+                        f"{user_id}_{self.plugin_data['version']}_{uuid.uuid4().hex}"
+                    ),
+                    max_retries=1,
+                )
+                return {
+                    "skipped": False,
+                    "mode": "job",
+                    "job_id": job.id,
+                    "service_keys": service_keys,
+                }
+            except Exception as error:
+                logger.warning(
+                    "Library service install job enqueue failed; falling back",
+                    error=str(error),
+                )
+
+        async def _install_then_start(service_key: str) -> Dict[str, Any]:
+            prepare_kwargs = {
+                "full_install": full_install,
+                "force_recreate": force_recreate,
+            }
+            if self._supports_installer_user_id_kwarg(prepare_service):
+                prepare_kwargs["installer_user_id"] = user_id
+
+            install_result = await prepare_service(service_key, **prepare_kwargs)
+            payload: Dict[str, Any] = {
+                "service": service_key,
+            }
+            if isinstance(install_result, dict):
+                payload.update(install_result)
+            else:
+                payload["result"] = install_result
+
+            if (
+                auto_start
+                and callable(start_service)
+                and isinstance(install_result, dict)
+                and bool(install_result.get("success"))
+            ):
+                payload["start"] = await start_service(service_key)
+
+            return payload
+
+        installs: List[Dict[str, Any]] = []
+        if async_mode:
+            loop = asyncio.get_running_loop()
+            for key in service_keys:
+                loop.create_task(_install_then_start(key))
+                installs.append({"service": key, "scheduled": True})
+            return {
+                "skipped": False,
+                "mode": "async",
+                "installs": installs,
+                "auto_start": auto_start,
+            }
+
+        for key in service_keys:
+            try:
+                installs.append(await _install_then_start(key))
+            except Exception as error:
+                installs.append(
+                    {
+                        "service": key,
+                        "success": False,
+                        "error": str(error),
+                    }
+                )
+
+        return {
+            "skipped": False,
+            "mode": "sync",
+            "installs": installs,
+            "auto_start": auto_start,
+        }
+
+    async def _collect_service_health(self) -> Dict[str, Any]:
+        if not callable(health_check):
+            return {
+                "skipped": True,
+                "reason": "library_service_ops_missing_health_check",
+            }
+
+        try:
+            status = await health_check("library_service")
+            return {
+                "skipped": False,
+                "services": [{"service": "library_service", **status}],
+            }
+        except Exception as error:
+            return {
+                "skipped": False,
+                "services": [
+                    {
+                        "service": "library_service",
+                        "success": False,
+                        "error": str(error),
+                    }
+                ],
+            }
+
     async def _perform_user_installation(
         self, user_id: str, db: AsyncSession, shared_plugin_path: Path
     ) -> Dict[str, Any]:
@@ -795,13 +1181,21 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                         )
                 return page_result
 
+            service_installs = await self._prepare_services(user_id)
+            service_health = None
+            if service_installs.get("mode") == "sync" and service_installs.get("auto_start"):
+                service_health = await self._collect_service_health()
+
             return {
                 "success": True,
                 "plugin_id": records["plugin_id"],
                 "modules_created": records["modules_created"],
+                "service_runtime_rows": records.get("service_runtime_rows", []),
                 "pages": page_result.get("pages", {}),
                 "pages_created": page_result.get("created_count", 0),
                 "library_service_runtime": runtime_result,
+                "service_installs": service_installs,
+                "service_health": service_health,
             }
         except Exception as error:  # pragma: no cover
             logger.error("Library plugin installation failed", error=str(error))
@@ -868,14 +1262,22 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             if not page_result.get("success"):
                 return page_result
 
+            service_installs = await self._prepare_services(user_id)
+            service_health = None
+            if service_installs.get("mode") == "sync" and service_installs.get("auto_start"):
+                service_health = await self._collect_service_health()
+
             return {
                 "success": True,
                 "plugin_id": sync_result.get("plugin_id"),
                 "module_ids": sync_result.get("module_ids", []),
                 "modules_added": sync_result.get("modules_added", []),
+                "service_runtime_rows": sync_result.get("service_runtime_rows", []),
                 "pages": page_result.get("pages", {}),
                 "pages_created": page_result.get("created_count", 0),
                 "library_service_runtime": runtime_result,
+                "service_installs": service_installs,
+                "service_health": service_health,
             }
         except Exception as error:  # pragma: no cover
             logger.error("Library plugin update failed", user_id=user_id, error=str(error))
@@ -1061,12 +1463,20 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 await db.execute(module_insert_stmt, insert_payload)
                 modules_added.append(module_id)
 
+            service_rows_result = await self._upsert_service_runtime_rows(
+                user_id=user_id,
+                plugin_id=plugin_id,
+                db=db,
+                now=now,
+            )
+
             await db.commit()
             return {
                 "success": True,
                 "plugin_id": plugin_id,
                 "module_ids": module_ids,
                 "modules_added": modules_added,
+                "service_runtime_rows": service_rows_result.get("service_ids", []),
             }
         except Exception as error:  # pragma: no cover
             await db.rollback()
@@ -1186,11 +1596,19 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 )
                 modules_created.append(module_id)
 
+            service_rows_result = await self._upsert_service_runtime_rows(
+                user_id=user_id,
+                plugin_id=plugin_id,
+                db=db,
+                now=now,
+            )
+
             await db.commit()
             return {
                 "success": True,
                 "plugin_id": plugin_id,
                 "modules_created": modules_created,
+                "service_runtime_rows": service_rows_result.get("service_ids", []),
             }
         except Exception as error:  # pragma: no cover
             await db.rollback()
@@ -1208,6 +1626,14 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 """
             )
             await db.execute(module_delete, {"plugin_id": plugin_id, "user_id": user_id})
+
+            service_delete = text(
+                """
+                DELETE FROM plugin_service_runtime
+                WHERE plugin_id = :plugin_id AND user_id = :user_id
+                """
+            )
+            await db.execute(service_delete, {"plugin_id": plugin_id, "user_id": user_id})
 
             plugin_delete = text(
                 """
