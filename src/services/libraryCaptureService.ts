@@ -19,14 +19,21 @@ const PROVIDER_SETTINGS_ID_MAP: Record<string, string> = {
   groq: "groq_api_keys_settings",
 };
 
-const LIBRARY_PROJECT_ENDPOINT =
-  "/api/v1/plugin-api/braindrive-library/library/projects?lifecycle=active";
+const LIBRARY_CAPTURE_API_BASE_CANDIDATES = [
+  "/api/v1/plugin-api/braindrive-library/library",
+  "/api/v1/plugin-api/BrainDriveLibraryPlugin/library",
+  "/api/v1/plugin-api/BrainDriveLibraryService/library",
+] as const;
+
+const LIBRARY_PROJECT_ENDPOINT_CANDIDATES = LIBRARY_CAPTURE_API_BASE_CANDIDATES.map(
+  (base) => base + "/projects?lifecycle=active"
+) as readonly string[];
 
 const LIBRARY_LIFE_ENDPOINT_CANDIDATES = [
-  "/api/v1/plugin-api/braindrive-library/library/life",
-  "/api/v1/plugin-api/braindrive-library/library/projects?path=life",
-  "/api/v1/plugin-api/braindrive-library/library/projects?scope=life",
-] as const;
+  ...LIBRARY_CAPTURE_API_BASE_CANDIDATES.map((base) => base + "/life"),
+  ...LIBRARY_CAPTURE_API_BASE_CANDIDATES.map((base) => base + "/projects?path=life"),
+  ...LIBRARY_CAPTURE_API_BASE_CANDIDATES.map((base) => base + "/projects?scope=life"),
+] as readonly string[];
 
 
 function extractTextFromData(data: any): string {
@@ -214,6 +221,35 @@ export class LibraryCaptureService {
     return this.api;
   }
 
+  private async requestGetWithFallback(endpoints: readonly string[]): Promise<any> {
+    const api = this.ensureApi();
+    let lastError: any = null;
+    let firstNonNotFoundError: any = null;
+
+    for (const endpoint of endpoints) {
+      try {
+        const response = await api.get(endpoint);
+        return normalizeApiPayload(response);
+      } catch (error) {
+        lastError = error;
+        const statusCode = Number((error as any)?.response?.status || 0);
+        if (statusCode !== 404 && !firstNonNotFoundError) {
+          firstNonNotFoundError = error;
+        }
+      }
+    }
+
+    if (firstNonNotFoundError) {
+      throw firstNonNotFoundError;
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    throw new Error("Library API request failed.");
+  }
+
   private async initializeUserId(): Promise<void> {
     if (this.currentUserId) {
       return;
@@ -273,9 +309,7 @@ export class LibraryCaptureService {
   }
 
   async loadProjectScopes(): Promise<ScopeOption[]> {
-    const api = this.ensureApi();
-    const response = await api.get(LIBRARY_PROJECT_ENDPOINT);
-    const payload = normalizeApiPayload(response);
+    const payload = await this.requestGetWithFallback(LIBRARY_PROJECT_ENDPOINT_CANDIDATES);
     const values = parseListPayload(payload);
     return values
       .map((entry) => normalizeScopeOption(entry, "projects"))
@@ -283,24 +317,15 @@ export class LibraryCaptureService {
   }
 
   async loadLifeScopes(): Promise<ScopeOption[]> {
-    const api = this.ensureApi();
-
-    for (const endpoint of LIBRARY_LIFE_ENDPOINT_CANDIDATES) {
-      try {
-        const response = await api.get(endpoint);
-        const payload = normalizeApiPayload(response);
-        const values = parseListPayload(payload);
-        if (values.length > 0) {
-          return values
-            .map((entry) => normalizeScopeOption(entry, "life"))
-            .filter((entry): entry is ScopeOption => Boolean(entry));
-        }
-      } catch (_error) {
-        // Try next candidate endpoint.
-      }
+    try {
+      const payload = await this.requestGetWithFallback(LIBRARY_LIFE_ENDPOINT_CANDIDATES);
+      const values = parseListPayload(payload);
+      return values
+        .map((entry) => normalizeScopeOption(entry, "life"))
+        .filter((entry): entry is ScopeOption => Boolean(entry));
+    } catch (_error) {
+      return [];
     }
-
-    return [];
   }
 
   async processDocument(file: File): Promise<CaptureDocumentProcessResult> {

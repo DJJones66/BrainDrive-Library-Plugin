@@ -492,8 +492,9 @@ PAGE_SPECS: List[Dict[str, Any]] = [
     {
         "name": "WhyFinder",
         "route": "whyfinder",
-        "module_name": "LibraryCapture",
-        "display_name": "WhyFinder Capture",
+        "module_name": "BrainDriveChat",
+        "module_plugin_slug": "BrainDriveChat",
+        "display_name": "WhyFinder Chat",
         "description": "Focused life page for values and purpose discovery.",
         "module_args": {
             "conversation_type": "life-whyfinder",
@@ -504,13 +505,16 @@ PAGE_SPECS: List[Dict[str, Any]] = [
             "default_scope_path": "life/whyfinder",
             "apply_defaults_on_new_chat": True,
             "lock_project_scope": False,
+            "lock_persona_selection": False,
+            "lock_model_selection": False,
         },
     },
     {
         "name": "Career",
         "route": "career",
-        "module_name": "LibraryCapture",
-        "display_name": "Career Capture",
+        "module_name": "BrainDriveChat",
+        "module_plugin_slug": "BrainDriveChat",
+        "display_name": "Career Chat",
         "description": "Focused life page for career.",
         "module_args": {
             "conversation_type": "life-career",
@@ -521,13 +525,16 @@ PAGE_SPECS: List[Dict[str, Any]] = [
             "default_scope_path": "life/career",
             "apply_defaults_on_new_chat": True,
             "lock_project_scope": False,
+            "lock_persona_selection": False,
+            "lock_model_selection": False,
         },
     },
     {
         "name": "Finances",
         "route": "finances",
-        "module_name": "LibraryCapture",
-        "display_name": "Finances Capture",
+        "module_name": "BrainDriveChat",
+        "module_plugin_slug": "BrainDriveChat",
+        "display_name": "Finances Chat",
         "description": "Focused life page for finances.",
         "module_args": {
             "conversation_type": "life-finances",
@@ -538,13 +545,16 @@ PAGE_SPECS: List[Dict[str, Any]] = [
             "default_scope_path": "life/finances",
             "apply_defaults_on_new_chat": True,
             "lock_project_scope": False,
+            "lock_persona_selection": False,
+            "lock_model_selection": False,
         },
     },
     {
         "name": "Fitness",
         "route": "fitness",
-        "module_name": "LibraryCapture",
-        "display_name": "Fitness Capture",
+        "module_name": "BrainDriveChat",
+        "module_plugin_slug": "BrainDriveChat",
+        "display_name": "Fitness Chat",
         "description": "Focused life page for fitness.",
         "module_args": {
             "conversation_type": "life-fitness",
@@ -555,13 +565,16 @@ PAGE_SPECS: List[Dict[str, Any]] = [
             "default_scope_path": "life/fitness",
             "apply_defaults_on_new_chat": True,
             "lock_project_scope": False,
+            "lock_persona_selection": False,
+            "lock_model_selection": False,
         },
     },
     {
         "name": "Relationships",
         "route": "relationships",
-        "module_name": "LibraryCapture",
-        "display_name": "Relationships Capture",
+        "module_name": "BrainDriveChat",
+        "module_plugin_slug": "BrainDriveChat",
+        "display_name": "Relationships Chat",
         "description": "Focused life page for relationships.",
         "module_args": {
             "conversation_type": "life-relationships",
@@ -572,6 +585,8 @@ PAGE_SPECS: List[Dict[str, Any]] = [
             "default_scope_path": "life/relationships",
             "apply_defaults_on_new_chat": True,
             "lock_project_scope": False,
+            "lock_persona_selection": False,
+            "lock_model_selection": False,
         },
     },
 ]
@@ -1048,9 +1063,81 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
               user_id = excluded.user_id
             """
         )
+        existing_service_stmt = text(
+            """
+            SELECT id, user_id
+            FROM plugin_service_runtime
+            WHERE plugin_slug = :plugin_slug
+              AND name = :name
+              AND (
+                runtime_dir_key = :runtime_dir_key
+                OR (runtime_dir_key IS NULL AND :runtime_dir_key IS NULL)
+              )
+            ORDER BY created_at ASC, id ASC
+            """
+        )
+        duplicate_runtime_delete_stmt = text(
+            """
+            DELETE FROM plugin_service_runtime
+            WHERE id = :service_id
+            """
+        )
 
-        created_ids: List[str] = []
+        service_ids: List[str] = []
+        shared_owner_user_ids: List[str] = []
+        should_prepare_services = False
+
         for service_data in self._build_runtime_service_rows():
+            runtime_dir_key = service_data.get("runtime_dir_key")
+            existing_result = await db.execute(
+                existing_service_stmt,
+                {
+                    "plugin_slug": self.plugin_data["plugin_slug"],
+                    "name": service_data["name"],
+                    "runtime_dir_key": runtime_dir_key,
+                },
+            )
+            existing_rows = existing_result.fetchall()
+            existing_row = existing_rows[0] if existing_rows else None
+            if len(existing_rows) > 1:
+                for duplicate_row in existing_rows[1:]:
+                    duplicate_service_id = (
+                        duplicate_row.id if hasattr(duplicate_row, "id") else duplicate_row[0]
+                    )
+                    await db.execute(
+                        duplicate_runtime_delete_stmt,
+                        {"service_id": duplicate_service_id},
+                    )
+                    logger.warning(
+                        "Removed duplicate Library service runtime row",
+                        duplicate_service_id=duplicate_service_id,
+                        owner_user_id=(
+                            duplicate_row.user_id
+                            if hasattr(duplicate_row, "user_id")
+                            else duplicate_row[1]
+                        ),
+                        service_name=service_data["name"],
+                    )
+
+            if existing_row is not None:
+                existing_user_id = (
+                    existing_row.user_id if hasattr(existing_row, "user_id") else existing_row[1]
+                )
+                existing_service_id = (
+                    existing_row.id if hasattr(existing_row, "id") else existing_row[0]
+                )
+                if str(existing_user_id) != str(user_id):
+                    logger.info(
+                        "Reusing shared Library service runtime row",
+                        current_user_id=user_id,
+                        owner_user_id=existing_user_id,
+                        service_name=service_data["name"],
+                        service_runtime_id=existing_service_id,
+                    )
+                    service_ids.append(str(existing_service_id))
+                    shared_owner_user_ids.append(str(existing_user_id))
+                    continue
+
             service_id = (
                 f"{user_id}_{self.plugin_data['plugin_slug']}_{service_data['name']}"
             )
@@ -1070,7 +1157,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 "required_env_vars": json.dumps(
                     service_data.get("required_env_vars", [])
                 ),
-                "runtime_dir_key": service_data.get("runtime_dir_key"),
+                "runtime_dir_key": runtime_dir_key,
                 "env_inherit": service_data.get("env_inherit"),
                 "env_overrides": json.dumps(service_data.get("env_overrides") or {}),
                 "status": "pending",
@@ -1079,9 +1166,15 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 "user_id": user_id,
             }
             await db.execute(upsert_stmt, payload)
-            created_ids.append(service_id)
+            service_ids.append(service_id)
+            should_prepare_services = True
 
-        return {"success": True, "service_ids": created_ids}
+        return {
+            "success": True,
+            "service_ids": service_ids,
+            "prepare_services": should_prepare_services,
+            "shared_owner_user_ids": sorted(set(shared_owner_user_ids)),
+        }
 
     async def _prepare_services(self, user_id: str) -> Dict[str, Any]:
         if not callable(prepare_service):
@@ -1607,7 +1700,15 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                         )
                 return page_result
 
-            service_installs = await self._prepare_services(user_id)
+            should_prepare_services = bool(records.get("prepare_services", True))
+            if should_prepare_services:
+                service_installs = await self._prepare_services(user_id)
+            else:
+                service_installs = {
+                    "skipped": True,
+                    "reason": "shared_library_service_runtime_exists",
+                    "owner_user_ids": records.get("shared_service_owner_user_ids", []),
+                }
             model_prefetch = await self._enqueue_library_ollama_prefetch(user_id, db)
             service_health = None
             if service_installs.get("mode") == "sync" and service_installs.get("auto_start"):
@@ -1690,7 +1791,15 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             if not page_result.get("success"):
                 return page_result
 
-            service_installs = await self._prepare_services(user_id)
+            should_prepare_services = bool(sync_result.get("prepare_services", True))
+            if should_prepare_services:
+                service_installs = await self._prepare_services(user_id)
+            else:
+                service_installs = {
+                    "skipped": True,
+                    "reason": "shared_library_service_runtime_exists",
+                    "owner_user_ids": sync_result.get("shared_service_owner_user_ids", []),
+                }
             model_prefetch = await self._enqueue_library_ollama_prefetch(user_id, db)
             service_health = None
             if service_installs.get("mode") == "sync" and service_installs.get("auto_start"):
@@ -1907,6 +2016,10 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 "module_ids": module_ids,
                 "modules_added": modules_added,
                 "service_runtime_rows": service_rows_result.get("service_ids", []),
+                "prepare_services": bool(service_rows_result.get("prepare_services", True)),
+                "shared_service_owner_user_ids": service_rows_result.get(
+                    "shared_owner_user_ids", []
+                ),
             }
         except Exception as error:  # pragma: no cover
             await db.rollback()
@@ -2039,6 +2152,10 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 "plugin_id": plugin_id,
                 "modules_created": modules_created,
                 "service_runtime_rows": service_rows_result.get("service_ids", []),
+                "prepare_services": bool(service_rows_result.get("prepare_services", True)),
+                "shared_service_owner_user_ids": service_rows_result.get(
+                    "shared_owner_user_ids", []
+                ),
             }
         except Exception as error:  # pragma: no cover
             await db.rollback()
@@ -2057,13 +2174,133 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             )
             await db.execute(module_delete, {"plugin_id": plugin_id, "user_id": user_id})
 
-            service_delete = text(
+            now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            service_rows_stmt = text(
                 """
-                DELETE FROM plugin_service_runtime
+                SELECT id, name
+                FROM plugin_service_runtime
                 WHERE plugin_id = :plugin_id AND user_id = :user_id
                 """
             )
-            await db.execute(service_delete, {"plugin_id": plugin_id, "user_id": user_id})
+            service_rows_result = await db.execute(
+                service_rows_stmt,
+                {"plugin_id": plugin_id, "user_id": user_id},
+            )
+            service_rows = service_rows_result.fetchall()
+
+            transfer_candidate_stmt = text(
+                """
+                SELECT id, user_id
+                FROM plugin
+                WHERE plugin_slug = :plugin_slug
+                  AND user_id != :user_id
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """
+            )
+            transfer_candidate_result = await db.execute(
+                transfer_candidate_stmt,
+                {
+                    "plugin_slug": self.plugin_data["plugin_slug"],
+                    "user_id": user_id,
+                },
+            )
+            transfer_candidate = transfer_candidate_result.fetchone()
+
+            transferred_services = 0
+            deduped_services = 0
+            if service_rows and transfer_candidate is not None:
+                transfer_plugin_id = (
+                    transfer_candidate.id
+                    if hasattr(transfer_candidate, "id")
+                    else transfer_candidate[0]
+                )
+                transfer_user_id = (
+                    transfer_candidate.user_id
+                    if hasattr(transfer_candidate, "user_id")
+                    else transfer_candidate[1]
+                )
+
+                service_exists_stmt = text(
+                    """
+                    SELECT id
+                    FROM plugin_service_runtime
+                    WHERE id = :service_id
+                    LIMIT 1
+                    """
+                )
+                service_transfer_stmt = text(
+                    """
+                    UPDATE plugin_service_runtime
+                    SET id = :new_id,
+                        plugin_id = :new_plugin_id,
+                        user_id = :new_user_id,
+                        updated_at = :updated_at
+                    WHERE id = :old_id
+                    """
+                )
+                service_delete_by_id_stmt = text(
+                    """
+                    DELETE FROM plugin_service_runtime
+                    WHERE id = :service_id
+                    """
+                )
+
+                for service_row in service_rows:
+                    old_service_id = (
+                        service_row.id if hasattr(service_row, "id") else service_row[0]
+                    )
+                    service_name = (
+                        service_row.name if hasattr(service_row, "name") else service_row[1]
+                    )
+                    new_service_id = (
+                        f"{transfer_user_id}_{self.plugin_data['plugin_slug']}_{service_name}"
+                    )
+
+                    if str(old_service_id) != str(new_service_id):
+                        existing_target_result = await db.execute(
+                            service_exists_stmt,
+                            {"service_id": new_service_id},
+                        )
+                        existing_target = existing_target_result.scalar_one_or_none()
+                        if existing_target is not None:
+                            await db.execute(
+                                service_delete_by_id_stmt,
+                                {"service_id": old_service_id},
+                            )
+                            deduped_services += 1
+                            continue
+
+                    await db.execute(
+                        service_transfer_stmt,
+                        {
+                            "old_id": old_service_id,
+                            "new_id": new_service_id,
+                            "new_plugin_id": transfer_plugin_id,
+                            "new_user_id": transfer_user_id,
+                            "updated_at": now,
+                        },
+                    )
+                    transferred_services += 1
+
+                logger.info(
+                    "Transferred shared Library service runtime ownership",
+                    from_user_id=user_id,
+                    to_user_id=transfer_user_id,
+                    transferred_services=transferred_services,
+                    deduped_services=deduped_services,
+                )
+            else:
+                service_delete = text(
+                    """
+                    DELETE FROM plugin_service_runtime
+                    WHERE plugin_id = :plugin_id AND user_id = :user_id
+                    """
+                )
+                await db.execute(
+                    service_delete,
+                    {"plugin_id": plugin_id, "user_id": user_id},
+                )
 
             plugin_delete = text(
                 """
@@ -2138,11 +2375,22 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             return {"success": True, "page_id": existing_page_id, "created": False}
 
         module_name = page_spec["module_name"]
-        module_id = await self._resolve_module_id(user_id, db, modules_created, module_name)
+        module_plugin_slug = str(
+            page_spec.get("module_plugin_slug") or self.plugin_data["plugin_slug"]
+        )
+        module_id = await self._resolve_module_id(
+            user_id=user_id,
+            db=db,
+            modules_created=modules_created,
+            module_name=module_name,
+            module_plugin_slug=module_plugin_slug,
+        )
         if not module_id:
             return {
                 "success": False,
-                "error": f"Unable to resolve {module_name} module id.",
+                "error": (
+                    f"Unable to resolve module id for {module_plugin_slug}.{module_name}."
+                ),
             }
 
         now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -2150,6 +2398,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             module_id=module_id,
             display_name=page_spec["display_name"],
             module_name=module_name,
+            module_plugin_slug=module_plugin_slug,
             module_args=page_spec.get("module_args"),
         )
 
@@ -2190,27 +2439,32 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
         db: AsyncSession,
         modules_created: List[str],
         module_name: str,
+        module_plugin_slug: str,
     ) -> Optional[str]:
-        suffix = f"_{module_name}"
-        for created_id in modules_created:
-            if created_id.endswith(suffix):
-                return created_id
+        normalized_plugin_slug = str(module_plugin_slug or "").strip()
+        if normalized_plugin_slug == self.plugin_data["plugin_slug"]:
+            suffix = f"_{module_name}"
+            for created_id in modules_created:
+                if created_id.endswith(suffix):
+                    return created_id
 
         fallback_stmt = text(
             """
-            SELECT id FROM module
-            WHERE user_id = :user_id
-              AND plugin_id = :plugin_id
-              AND name = :name
+            SELECT m.id
+            FROM module m
+            JOIN plugin p ON p.id = m.plugin_id
+            WHERE m.user_id = :user_id
+              AND p.user_id = :user_id
+              AND p.plugin_slug = :plugin_slug
+              AND m.name = :name
             LIMIT 1
             """
         )
-        plugin_id = f"{user_id}_{self.plugin_data['plugin_slug']}"
         fallback_result = await db.execute(
             fallback_stmt,
             {
                 "user_id": user_id,
-                "plugin_id": plugin_id,
+                "plugin_slug": normalized_plugin_slug,
                 "name": module_name,
             },
         )
@@ -2224,10 +2478,11 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
         module_id: str,
         display_name: str,
         module_name: str,
+        module_plugin_slug: str,
         module_args: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         timestamp_ms = int(datetime.datetime.utcnow().timestamp() * 1000)
-        layout_id = f"{module_name}_{module_id}_{timestamp_ms}"
+        layout_id = f"{module_plugin_slug}_{module_id}_{timestamp_ms}_{uuid.uuid4().hex[:8]}"
         args: Dict[str, Any] = {
             "moduleId": module_id,
             "displayName": display_name,
@@ -2235,22 +2490,28 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
         if isinstance(module_args, dict):
             args.update(module_args)
 
+        is_chat_module = module_plugin_slug == "BrainDriveChat"
+        desktop_h = 10 if is_chat_module else 12
+        tablet_w = 4 if is_chat_module else 8
+        tablet_h = 3 if is_chat_module else 12
+        mobile_h = 3 if is_chat_module else 12
+
         desktop = {
             "i": layout_id,
             "x": 0,
             "y": 0,
             "w": 12,
-            "h": 12,
-            "pluginId": self.plugin_data["plugin_slug"],
+            "h": desktop_h,
+            "pluginId": module_plugin_slug,
             "args": dict(args),
         }
         tablet = {
             "i": layout_id,
             "x": 0,
             "y": 0,
-            "w": 8,
-            "h": 12,
-            "pluginId": self.plugin_data["plugin_slug"],
+            "w": tablet_w,
+            "h": tablet_h,
+            "pluginId": module_plugin_slug,
             "args": dict(args),
         }
         mobile = {
@@ -2258,8 +2519,8 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             "x": 0,
             "y": 0,
             "w": 4,
-            "h": 12,
-            "pluginId": self.plugin_data["plugin_slug"],
+            "h": mobile_h,
+            "pluginId": module_plugin_slug,
             "args": dict(args),
         }
         return {

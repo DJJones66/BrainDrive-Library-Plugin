@@ -19,6 +19,16 @@ DEFAULT_LIBRARY_SERVICE_REPO_URL = "https://github.com/DJJones66/Library-Service
 DEFAULT_PROCESS_HOST = "127.0.0.1"
 DEFAULT_PROCESS_PORT = "18170"
 DEFAULT_REQUIRE_USER_HEADER = "true"
+DEFAULT_HEALTH_STARTUP_ATTEMPTS = 20
+DEFAULT_HEALTH_STARTUP_DELAY_SECONDS = 0.5
+DEFAULT_INSTALL_ATTEMPTS = 2
+DEFAULT_RUNTIME_PACKAGES = [
+    "fastapi",
+    "uvicorn",
+    "dulwich",
+    "httpx",
+]
+RUNTIME_IMPORT_CHECK = "import fastapi, uvicorn, dulwich, httpx"
 
 DEFAULT_REQUIRED_ENV_VARS = [
     "PROCESS_HOST",
@@ -493,7 +503,13 @@ async def _run_python(
     if not script.exists():
         return {"success": False, "error": f"missing script: {script}", "cmd": ""}
 
-    cmd = ["python3", str(script)]
+    python_cmd = (
+        sys.executable
+        or shutil.which("python3")
+        or shutil.which("python")
+        or ("py" if os.name == "nt" else "python3")
+    )
+    cmd = [python_cmd, str(script)]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(cwd) if cwd else None,
@@ -508,6 +524,148 @@ async def _run_python(
         "cmd": " ".join(cmd),
         "stdout": stdout.decode(errors="replace"),
         "stderr": stderr.decode(errors="replace"),
+    }
+
+
+async def _run_venv_python(
+    service: ServiceConfig,
+    args: List[str],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    cwd: Optional[Path] = None,
+) -> Dict[str, Any]:
+    python_path = _venv_python(service)
+    if not python_path.exists():
+        return {
+            "success": False,
+            "code": 1,
+            "cmd": "",
+            "stdout": "",
+            "stderr": f"venv python missing: {python_path}",
+        }
+
+    cmd = [str(python_path), *args]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd) if cwd else None,
+        env=_normalize_env(env),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return {
+        "success": proc.returncode == 0,
+        "code": proc.returncode,
+        "cmd": " ".join(cmd),
+        "stdout": stdout.decode(errors="replace"),
+        "stderr": stderr.decode(errors="replace"),
+    }
+
+
+async def _verify_runtime_dependencies(
+    service: ServiceConfig,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    result = await _run_venv_python(
+        service,
+        ["-c", RUNTIME_IMPORT_CHECK],
+        env=env,
+        cwd=service.repo_path,
+    )
+    return {
+        **result,
+        "required_imports": list(DEFAULT_RUNTIME_PACKAGES),
+    }
+
+
+async def _repair_runtime_dependencies(
+    service: ServiceConfig,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    steps: List[Dict[str, Any]] = []
+
+    # First try matching the runtime repo's requirements. If that fails due
+    # to optional/dev packages, fall back to minimum runtime deps.
+    upgrade_pip = await _run_venv_python(
+        service,
+        ["-m", "pip", "install", "--upgrade", "pip"],
+        env=env,
+        cwd=service.repo_path,
+    )
+    steps.append({"step": "pip_upgrade", **upgrade_pip})
+
+    requirements = service.repo_path / "requirements.txt"
+    if requirements.exists():
+        requirements_install = await _run_venv_python(
+            service,
+            ["-m", "pip", "install", "-r", str(requirements)],
+            env=env,
+            cwd=service.repo_path,
+        )
+        steps.append({"step": "install_requirements", **requirements_install})
+
+    runtime_install = await _run_venv_python(
+        service,
+        ["-m", "pip", "install", "--upgrade", *DEFAULT_RUNTIME_PACKAGES],
+        env=env,
+        cwd=service.repo_path,
+    )
+    steps.append({"step": "install_runtime_packages", **runtime_install})
+
+    verify_result = await _verify_runtime_dependencies(service, env=env)
+    steps.append({"step": "verify_runtime_dependencies", **verify_result})
+
+    return {
+        "success": bool(verify_result.get("success")),
+        "steps": steps,
+        "verify": verify_result,
+    }
+
+
+def _tail_service_log(service: ServiceConfig, *, line_count: int = 120) -> str:
+    log_path = service.repo_path / "service_runtime.log"
+    if not log_path.exists():
+        return ""
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = content.splitlines()
+    return "\n".join(lines[-line_count:])
+
+
+async def _wait_for_service_health(
+    service_key: str,
+    *,
+    attempts: int = DEFAULT_HEALTH_STARTUP_ATTEMPTS,
+    delay_seconds: float = DEFAULT_HEALTH_STARTUP_DELAY_SECONDS,
+) -> Dict[str, Any]:
+    last_result: Optional[Dict[str, Any]] = None
+    for attempt in range(1, attempts + 1):
+        result = await health_check(service_key, timeout=3)
+        last_result = result
+        if result.get("success"):
+            return {
+                "success": True,
+                "attempt": attempt,
+                "result": result,
+            }
+        if attempt < attempts:
+            await asyncio.sleep(delay_seconds)
+    return {
+        "success": False,
+        "attempt": attempts,
+        "result": last_result or {"success": False, "error": "health check did not run"},
+    }
+
+
+def _annotate_step(step_name: str, attempt: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "step": step_name,
+        "attempt": attempt,
+        **payload,
     }
 
 
@@ -552,18 +710,56 @@ async def prepare_service(
     init_script = service.scripts_dir / "init_db.py"
 
     script_env = _service_default_env_values(service)
-    if force_recreate:
-        script_env["VENV_FORCE_RECREATE"] = "1"
 
-    create_result = await _run_python(create_script, env=script_env, cwd=service.repo_path)
-    if not create_result.get("success"):
-        return {"success": False, "step": "create_venv", **create_result}
+    steps: List[Dict[str, Any]] = []
+    install_successful = False
+    install_failure_reason = "install"
 
-    install_result = await _run_python(install_script, env=script_env, cwd=service.repo_path)
-    if not install_result.get("success"):
-        return {"success": False, "step": "install", **install_result}
+    for attempt in range(1, DEFAULT_INSTALL_ATTEMPTS + 1):
+        attempt_env = dict(script_env)
+        if force_recreate or attempt > 1:
+            attempt_env["VENV_FORCE_RECREATE"] = "1"
 
-    steps = [create_result, install_result]
+        create_result = await _run_python(create_script, env=attempt_env, cwd=service.repo_path)
+        steps.append(_annotate_step("create_venv", attempt, create_result))
+        if not create_result.get("success"):
+            install_failure_reason = "create_venv"
+            continue
+
+        install_result = await _run_python(install_script, env=attempt_env, cwd=service.repo_path)
+        steps.append(_annotate_step("install_with_venv", attempt, install_result))
+
+        verify_result = await _verify_runtime_dependencies(service, env=attempt_env)
+        steps.append(_annotate_step("verify_runtime_dependencies", attempt, verify_result))
+
+        if install_result.get("success") and verify_result.get("success"):
+            install_successful = True
+            break
+
+        repair_result = await _repair_runtime_dependencies(service, env=attempt_env)
+        steps.append(_annotate_step("repair_runtime_dependencies", attempt, repair_result))
+        if repair_result.get("success"):
+            install_successful = True
+            break
+
+        install_failure_reason = (
+            "install_with_venv"
+            if not install_result.get("success")
+            else "verify_runtime_dependencies"
+        )
+
+    if not install_successful:
+        return {
+            "success": False,
+            "step": install_failure_reason,
+            "service": service_key,
+            "steps": steps,
+            "env": env_write,
+            "error": (
+                "Library service runtime dependencies could not be installed. "
+                "See step outputs for the failing command."
+            ),
+        }
 
     if full_install and init_script.exists():
         init_result = await _run_python(init_script, env=script_env, cwd=service.repo_path)
@@ -601,7 +797,27 @@ async def start_service(service_key: str) -> Dict[str, Any]:
 
     start_script = service.scripts_dir / "start_with_venv.py"
     script_env = _service_default_env_values(service)
-    return await _run_python(start_script, env=script_env, cwd=service.repo_path)
+    start_result = await _run_python(start_script, env=script_env, cwd=service.repo_path)
+    if not start_result.get("success"):
+        return start_result
+
+    health_result = await _wait_for_service_health(service_key)
+    if health_result.get("success"):
+        return {
+            **start_result,
+            "health": health_result,
+        }
+
+    return {
+        "success": False,
+        "code": start_result.get("code"),
+        "cmd": start_result.get("cmd"),
+        "stdout": start_result.get("stdout"),
+        "stderr": start_result.get("stderr"),
+        "health": health_result,
+        "log_tail": _tail_service_log(service),
+        "error": "service failed health check after startup",
+    }
 
 
 async def shutdown_service(service_key: str) -> Dict[str, Any]:
