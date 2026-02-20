@@ -19,8 +19,9 @@ import subprocess
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Set
 
+import httpx
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +41,25 @@ except Exception:  # pragma: no cover - fallback for remote install
                 break
     except Exception:
         get_job_manager = None
+
+try:
+    from app.utils.ollama import normalize_server_base, make_dedupe_key  # type: ignore
+except Exception:  # pragma: no cover - fallback for remote install
+    def normalize_server_base(url: str) -> str:
+        raw = str(url or "").strip().rstrip("/")
+        if raw.endswith("/api/pull"):
+            raw = raw[: -len("/api/pull")]
+        if raw.endswith("/api"):
+            raw = raw[: -len("/api")]
+        return raw
+
+    def make_dedupe_key(server_base: str, name: str) -> str:
+        return f"{server_base}|{name}"
+
+try:
+    from app.utils.json_parsing import safe_encrypted_json_parse  # type: ignore
+except Exception:  # pragma: no cover - fallback for remote install
+    safe_encrypted_json_parse = None
 
 CURRENT_DIR = Path(__file__).resolve().parent
 
@@ -105,6 +125,59 @@ DEFAULT_LIBRARY_REQUIRED_ENV_VARS = [
     "BRAINDRIVE_LIBRARY_REQUIRE_USER_HEADER",
     SERVICES_RUNTIME_ENV_VAR,
 ]
+
+LIBRARY_OLLAMA_SETTINGS_DEFINITION_ID = "ollama_servers_settings"
+DEFAULT_LIBRARY_OLLAMA_PREFETCH_MODEL = "hf.co/mradermacher/granite-4.0-micro-GGUF:Q8_0"
+LIBRARY_PREFETCH_MODEL_ENV_VAR = "BRAINDRIVE_LIBRARY_PREFETCH_MODEL"
+LIBRARY_PREFETCH_ENABLED_ENV_VAR = "BRAINDRIVE_LIBRARY_PREFETCH_ENABLED"
+LIBRARY_PREFETCH_SERVER_ID_ENV_VAR = "BRAINDRIVE_LIBRARY_PREFETCH_OLLAMA_SERVER_ID"
+LIBRARY_PREFETCH_SERVER_URL_ENV_VAR = "BRAINDRIVE_LIBRARY_PREFETCH_OLLAMA_SERVER_URL"
+
+
+def _expand_model_tokens(model: Dict[str, Any]) -> Set[str]:
+    tokens: Set[str] = set()
+    for key in ("name", "model", "digest"):
+        value = model.get(key)
+        if value:
+            tokens.add(str(value))
+
+    aliases = model.get("aliases") or []
+    if isinstance(aliases, list):
+        for alias in aliases:
+            if isinstance(alias, str):
+                tokens.add(alias)
+            elif isinstance(alias, dict):
+                for value in alias.values():
+                    if value:
+                        tokens.add(str(value))
+
+    expanded: Set[str] = set()
+    for token in tokens:
+        cleaned = str(token).strip().lower()
+        if not cleaned:
+            continue
+        expanded.add(cleaned)
+        if ":" in cleaned:
+            expanded.add(cleaned.split(":", 1)[0])
+
+    return expanded
+
+
+def _build_model_token_index(payload: Dict[str, Any]) -> Set[str]:
+    tokens: Set[str] = set()
+    models = payload.get("models") or []
+    if not isinstance(models, list):
+        return tokens
+
+    for model in models:
+        if isinstance(model, dict):
+            tokens.update(_expand_model_tokens(model))
+
+    return tokens
+
+
+def _model_lookup_tokens(model_name: str) -> Set[str]:
+    return _expand_model_tokens({"name": model_name})
 
 PLUGIN_DATA: Dict[str, Any] = {
     "name": "BrainDrive Library Plugin",
@@ -566,19 +639,52 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
     def _runtime_lock(self, lock_file: Path) -> Iterator[None]:
         lock_file.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_file.open("a+", encoding="utf-8")
-        locker = None
+        lock_backend: Optional[str] = None
+        lock_module = None
         try:
-            try:
-                import fcntl as locker  # type: ignore
+            if os.name == "nt":
+                try:
+                    import msvcrt  # type: ignore
 
-                locker.flock(handle.fileno(), locker.LOCK_EX)
-            except Exception:
-                locker = None
+                    # msvcrt.locking requires a non-zero byte range.
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write("0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    lock_backend = "msvcrt"
+                    lock_module = msvcrt
+                except Exception as error:
+                    logger.warning(
+                        "Library runtime lock unavailable on Windows",
+                        lock_file=str(lock_file),
+                        error=str(error),
+                    )
+            else:
+                try:
+                    import fcntl as locker  # type: ignore
+
+                    locker.flock(handle.fileno(), locker.LOCK_EX)
+                    lock_backend = "fcntl"
+                    lock_module = locker
+                except Exception as error:
+                    logger.warning(
+                        "Library runtime lock unavailable on POSIX",
+                        lock_file=str(lock_file),
+                        error=str(error),
+                    )
             yield
         finally:
-            if locker is not None:
+            if lock_backend == "msvcrt" and lock_module is not None:
                 try:
-                    locker.flock(handle.fileno(), locker.LOCK_UN)
+                    handle.seek(0)
+                    lock_module.locking(handle.fileno(), lock_module.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            elif lock_backend == "fcntl" and lock_module is not None:
+                try:
+                    lock_module.flock(handle.fileno(), lock_module.LOCK_UN)
                 except Exception:
                     pass
             handle.close()
@@ -1041,6 +1147,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                         "force_recreate": force_recreate,
                         "auto_start": auto_start,
                         "installer_user_id": user_id,
+                        "require_user_bootstrap": True,
                     },
                     user_id=user_id,
                     workspace_id=None,
@@ -1121,6 +1228,325 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
             "auto_start": auto_start,
         }
 
+    def _library_prefetch_enabled(self) -> bool:
+        raw = str(
+            os.environ.get(LIBRARY_PREFETCH_ENABLED_ENV_VAR, "1")
+            or "1"
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _library_prefetch_model_name(self) -> str:
+        model_name = os.environ.get(
+            LIBRARY_PREFETCH_MODEL_ENV_VAR,
+            DEFAULT_LIBRARY_OLLAMA_PREFETCH_MODEL,
+        )
+        return str(model_name or "").strip()
+
+    def _parse_settings_payload(
+        self,
+        raw_value: Any,
+        *,
+        setting_id: Optional[str],
+        definition_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if isinstance(raw_value, dict):
+            return raw_value
+
+        if safe_encrypted_json_parse:
+            try:
+                parsed_value = safe_encrypted_json_parse(
+                    raw_value,
+                    context=f"library_lifecycle:{definition_id}",
+                    setting_id=setting_id or "",
+                    definition_id=definition_id,
+                )
+                if isinstance(parsed_value, dict):
+                    return parsed_value
+            except Exception as error:
+                logger.warning(
+                    "Failed to parse settings payload with safe parser",
+                    definition_id=definition_id,
+                    setting_id=setting_id,
+                    error=str(error),
+                )
+
+        if isinstance(raw_value, str):
+            try:
+                parsed_value = json.loads(raw_value)
+                if isinstance(parsed_value, dict):
+                    return parsed_value
+            except Exception as error:
+                logger.warning(
+                    "Failed to parse settings payload",
+                    definition_id=definition_id,
+                    setting_id=setting_id,
+                    error=str(error),
+                )
+
+        return None
+
+    def _select_ollama_server(
+        self,
+        settings_payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        override_server_url = str(
+            os.environ.get(LIBRARY_PREFETCH_SERVER_URL_ENV_VAR, "") or ""
+        ).strip()
+        if override_server_url:
+            return {
+                "server_id": None,
+                "server_name": "env_override",
+                "server_url": normalize_server_base(override_server_url),
+                "api_key": None,
+                "selection_source": "env_override",
+            }
+
+        servers = settings_payload.get("servers") or []
+        if not isinstance(servers, list):
+            return None
+
+        valid_servers: List[Dict[str, Any]] = []
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            server_address = str(server.get("serverAddress") or "").strip()
+            if not server_address:
+                continue
+            valid_servers.append(server)
+
+        if not valid_servers:
+            return None
+
+        preferred_server_id = str(
+            os.environ.get(LIBRARY_PREFETCH_SERVER_ID_ENV_VAR, "") or ""
+        ).strip()
+        selected: Optional[Dict[str, Any]] = None
+
+        if preferred_server_id:
+            for server in valid_servers:
+                if str(server.get("id") or "").strip() == preferred_server_id:
+                    selected = server
+                    break
+
+        if selected is None:
+            for server in valid_servers:
+                if str(server.get("connectionStatus") or "").strip().lower() == "connected":
+                    selected = server
+                    break
+
+        if selected is None:
+            selected = valid_servers[0]
+
+        server_address = normalize_server_base(str(selected.get("serverAddress") or "").strip())
+        if not server_address:
+            return None
+
+        return {
+            "server_id": str(selected.get("id") or "").strip() or None,
+            "server_name": str(selected.get("serverName") or "").strip() or "ollama",
+            "server_url": server_address,
+            "api_key": str(selected.get("apiKey") or "").strip() or None,
+            "selection_source": "settings",
+        }
+
+    async def _resolve_ollama_server_for_prefetch(
+        self,
+        user_id: str,
+        db: AsyncSession,
+    ) -> Optional[Dict[str, Any]]:
+        stmt = text(
+            """
+            SELECT id, value
+            FROM settings_instances
+            WHERE definition_id = :definition_id
+              AND user_id = :user_id
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        )
+        result = await db.execute(
+            stmt,
+            {
+                "definition_id": LIBRARY_OLLAMA_SETTINGS_DEFINITION_ID,
+                "user_id": user_id,
+            },
+        )
+        row = result.first()
+        if row is None:
+            return None
+
+        row_map = row._mapping if hasattr(row, "_mapping") else {}
+        payload = self._parse_settings_payload(
+            row_map.get("value") if row_map else None,
+            setting_id=row_map.get("id") if row_map else None,
+            definition_id=LIBRARY_OLLAMA_SETTINGS_DEFINITION_ID,
+        )
+        if not payload:
+            return None
+
+        return self._select_ollama_server(payload)
+
+    async def _check_ollama_server_health(
+        self,
+        client: httpx.AsyncClient,
+        server_base: str,
+        headers: Dict[str, str],
+    ) -> bool:
+        try:
+            response = await client.get(f"{server_base}/api/version", headers=headers)
+            return response.status_code == 200
+        except Exception as error:
+            logger.warning(
+                "Library model prefetch health check failed",
+                server_url=server_base,
+                error=str(error),
+            )
+            return False
+
+    async def _fetch_ollama_tags(
+        self,
+        client: httpx.AsyncClient,
+        server_base: str,
+        headers: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            response = await client.get(f"{server_base}/api/tags", headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+        except Exception as error:
+            logger.warning(
+                "Library model prefetch tags lookup failed",
+                server_url=server_base,
+                error=str(error),
+            )
+            return None
+
+    async def _enqueue_library_ollama_prefetch(
+        self,
+        user_id: str,
+        db: AsyncSession,
+    ) -> Dict[str, Any]:
+        model_name = self._library_prefetch_model_name()
+        if not self._library_prefetch_enabled():
+            return {
+                "status": "skipped_unconfigured",
+                "reason": "prefetch_disabled",
+                "model_name": model_name,
+            }
+
+        if not model_name:
+            return {
+                "status": "skipped_unconfigured",
+                "reason": "model_name_missing",
+            }
+
+        server = await self._resolve_ollama_server_for_prefetch(user_id, db)
+        if not server:
+            return {
+                "status": "skipped_unconfigured",
+                "reason": "ollama_server_not_configured",
+                "model_name": model_name,
+            }
+
+        server_url = str(server.get("server_url") or "").strip()
+        server_base = normalize_server_base(server_url)
+        if not server_base.startswith(("http://", "https://")):
+            return {
+                "status": "skipped_unconfigured",
+                "reason": "invalid_server_url",
+                "model_name": model_name,
+                "server_url": server_url,
+            }
+
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        api_key = server.get("api_key")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            is_healthy = await self._check_ollama_server_health(client, server_base, headers)
+            if not is_healthy:
+                return {
+                    "status": "skipped_unhealthy",
+                    "reason": "ollama_health_check_failed",
+                    "model_name": model_name,
+                    "server_url": server_base,
+                    "server_id": server.get("server_id"),
+                    "server_name": server.get("server_name"),
+                }
+
+            tags_payload = await self._fetch_ollama_tags(client, server_base, headers)
+            if tags_payload:
+                installed_tokens = _build_model_token_index(tags_payload)
+                target_tokens = _model_lookup_tokens(model_name)
+                if target_tokens.intersection(installed_tokens):
+                    return {
+                        "status": "skipped_already_installed",
+                        "reason": "model_present",
+                        "model_name": model_name,
+                        "server_url": server_base,
+                        "server_id": server.get("server_id"),
+                        "server_name": server.get("server_name"),
+                    }
+
+        if not get_job_manager:
+            return {
+                "status": "enqueue_failed",
+                "reason": "job_manager_unavailable",
+                "model_name": model_name,
+                "server_url": server_base,
+                "server_id": server.get("server_id"),
+                "server_name": server.get("server_name"),
+            }
+
+        idempotency_key = (
+            f"library_prefetch_{user_id}_{self.plugin_data['plugin_slug']}_"
+            f"{make_dedupe_key(server_base, model_name)}"
+        )
+
+        try:
+            job_manager = await get_job_manager()
+            job, created = await job_manager.enqueue_job(
+                job_type="ollama.install",
+                payload={
+                    "model_name": model_name,
+                    "server_url": server_base,
+                    "force_reinstall": False,
+                },
+                user_id=user_id,
+                workspace_id=None,
+                idempotency_key=idempotency_key,
+                max_retries=1,
+            )
+            return {
+                "status": "queued",
+                "job_id": job.id,
+                "deduped": not created,
+                "model_name": model_name,
+                "server_url": server_base,
+                "server_id": server.get("server_id"),
+                "server_name": server.get("server_name"),
+                "idempotency_key": idempotency_key,
+            }
+        except Exception as error:
+            logger.warning(
+                "Failed to enqueue Library model prefetch",
+                user_id=user_id,
+                model_name=model_name,
+                server_url=server_base,
+                error=str(error),
+            )
+            return {
+                "status": "enqueue_failed",
+                "reason": "enqueue_error",
+                "error": str(error),
+                "model_name": model_name,
+                "server_url": server_base,
+                "server_id": server.get("server_id"),
+                "server_name": server.get("server_name"),
+            }
+
     async def _collect_service_health(self) -> Dict[str, Any]:
         if not callable(health_check):
             return {
@@ -1182,6 +1608,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 return page_result
 
             service_installs = await self._prepare_services(user_id)
+            model_prefetch = await self._enqueue_library_ollama_prefetch(user_id, db)
             service_health = None
             if service_installs.get("mode") == "sync" and service_installs.get("auto_start"):
                 service_health = await self._collect_service_health()
@@ -1195,6 +1622,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 "pages_created": page_result.get("created_count", 0),
                 "library_service_runtime": runtime_result,
                 "service_installs": service_installs,
+                "model_prefetch": model_prefetch,
                 "service_health": service_health,
             }
         except Exception as error:  # pragma: no cover
@@ -1263,6 +1691,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 return page_result
 
             service_installs = await self._prepare_services(user_id)
+            model_prefetch = await self._enqueue_library_ollama_prefetch(user_id, db)
             service_health = None
             if service_installs.get("mode") == "sync" and service_installs.get("auto_start"):
                 service_health = await self._collect_service_health()
@@ -1277,6 +1706,7 @@ class BrainDriveLibraryPluginLifecycleManager(CommunityPluginLifecycleBase):
                 "pages_created": page_result.get("created_count", 0),
                 "library_service_runtime": runtime_result,
                 "service_installs": service_installs,
+                "model_prefetch": model_prefetch,
                 "service_health": service_health,
             }
         except Exception as error:  # pragma: no cover

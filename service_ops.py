@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -431,7 +432,9 @@ def _apply_schema(service: ServiceConfig, scoped_root: Path) -> List[str]:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to import schema module: {schema_module_path}")
 
+    module_name = spec.name or f"library_service_schema_{abs(hash(str(schema_module_path)))}"
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)  # type: ignore[union-attr]
 
     ensure_fn = getattr(module, "ensure_scoped_library_structure", None)
@@ -456,6 +459,10 @@ def _bootstrap_first_user(service: ServiceConfig, installer_user_id: str) -> Dic
     normalized_user_id = _normalize_user_id(installer_user_id)
     library_root = _resolve_library_root_from_env(service)
     template_root = _resolve_template_root_from_env(service)
+    if not template_root.is_dir():
+        raise RuntimeError(
+            f"Library template root missing or invalid: {template_root}"
+        )
 
     scoped_root = library_root / "users" / normalized_user_id
     scoped_root.mkdir(parents=True, exist_ok=True)
